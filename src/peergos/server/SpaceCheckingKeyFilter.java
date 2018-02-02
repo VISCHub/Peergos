@@ -5,14 +5,19 @@ import peergos.server.mutable.*;
 import peergos.shared.cbor.*;
 import peergos.shared.corenode.*;
 import peergos.shared.crypto.hash.*;
+import peergos.shared.io.ipfs.api.JSONParser;
 import peergos.shared.merklebtree.*;
 import peergos.shared.mutable.*;
 import peergos.shared.storage.*;
 import peergos.shared.user.*;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.*;
+import java.util.stream.Collectors;
 
 /** This class checks whether a given user is using more storage space than their quota
  *
@@ -26,6 +31,7 @@ public class SpaceCheckingKeyFilter {
 
     private final Map<PublicKeyHash, Stat> currentView = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Usage> usage = new ConcurrentHashMap<>();
+    private final Path statePath;
 
     private static class Stat {
         public final String owner;
@@ -95,21 +101,85 @@ public class SpaceCheckingKeyFilter {
      * @param mutable
      * @param dht
      * @param quotaSupplier The quota supplier
+     * @param statePath path to local file with user usages
      */
     public SpaceCheckingKeyFilter(CoreNode core,
                                   MutablePointers mutable,
                                   ContentAddressedStorage dht,
-                                  Function<String, Long> quotaSupplier) {
+                                  Function<String, Long> quotaSupplier,
+                                  Path statePath) throws IOException {
         this.core = core;
         this.mutable = mutable;
         this.dht = dht;
         this.quotaSupplier = quotaSupplier;
-        // It's okay to do this asynchronously, as any users that try to write will get an error until their usage has
-        // been loaded
-        new Thread(this::loadAllOwners).start();
+        this.statePath = statePath;
+        init();
     }
 
-    private void loadAllOwners() {
+    /**
+     * Read stored usages and udate current view.
+     */
+    private void init() throws IOException {
+        try {
+            Map<String, Long> storedUsages = readUsages();
+            storedUsages.forEach((k,v) -> this.usage.put(k, new Usage(v)));
+        } catch (IOException ioe) {
+            System.out.println("Could not read usage-state from "+ this.statePath);
+            // calculate usage from scratch
+            calculateUsage();
+        }
+
+        //add shutdown-hook to call close
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> close()));
+        //remove state-path
+        Files.deleteIfExists(statePath);
+    }
+
+    /**
+     * Write current view of usages to this.statePath, completing any pending operations
+     */
+    private void close() {
+        try {
+            storeUsages();
+        } catch (IOException ioe) {
+            System.out.println("Could not store uages on close");
+            ioe.printStackTrace();
+        }
+    }
+    /**
+     * Read local file with cached user usages.
+     * @return previous usages
+     * @throws IOException
+     */
+    private Map<String, Long> readUsages() throws IOException {
+        String s = Files.readAllLines(statePath).stream()
+            .collect(
+                Collectors.joining()
+            );
+        return (Map<String, Long>) JSONParser.parse(s);
+    }
+
+    /**
+     * Store usages
+     * @throws IOException
+     */
+    private void storeUsages() throws IOException {
+        Map<String, Long> usage = this.usage.entrySet()
+            .stream()
+            .collect(
+                Collectors.toMap(
+                    e -> e.getKey(),
+                    e -> e.getValue().usage()
+                ));
+        Files.write(
+            statePath,
+            JSONParser.toString(usage).getBytes());
+    }
+
+    /**
+     * Walk the virtual file-system to calculate space used by each owner.
+     */
+    private void calculateUsage() {
         try {
             List<String> usernames = core.getUsernames("").get();
             for (String username : usernames) {
